@@ -77,6 +77,13 @@ jobs:
           print("Prepared app-only build without app entitlements.")
           PY
 
+      - name: Create local.properties
+        run: touch local.properties
+
+      - name: Build shared framework
+        run: |
+          CONFIG=release ./scripts/build-shared-framework.sh
+
       - name: Build shared framework
         run: |
           CONFIG=release ./scripts/build-shared-framework.sh
