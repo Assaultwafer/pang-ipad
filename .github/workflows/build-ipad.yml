@@ -1,0 +1,136 @@
+
+name: Build BitChord for iPad
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout BitChord
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen cmake
+          xcodebuild -version
+          java -version
+          rustc --version
+
+      - name: Prepare free-account build
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("AppleApp/project.yml")
+          source = path.read_text()
+
+          start = source.index(
+              "  BitChord:\n", source.index("targets:\n")
+          )
+          end = source.index("  BitChordWidget:\n", start)
+          app = source[start:end]
+
+          dependency = (
+              "      - target: BitChordWidget\n"
+              "        embed: true\n"
+          )
+          if dependency not in app:
+              raise SystemExit(
+                  "Could not find the BitChordWidget dependency."
+              )
+
+          app = app.replace(dependency, "", 1)
+
+          entitlement_block = "    entitlements:\n"
+          if entitlement_block not in app:
+              raise SystemExit(
+                  "Could not locate the app entitlements block."
+              )
+
+          # Omit the app's shared-group and macOS-only
+          # entitlements from this iOS-only build.
+          app = app[:app.index(entitlement_block)].rstrip() + "\n"
+
+          path.write_text(source[:start] + app + source[end:])
+          print("Prepared app-only build without app entitlements.")
+          PY
+
+      - name: Build shared framework
+        run: |
+          CONFIG=release ./scripts/build-shared-framework.sh
+
+      - name: Build native audio framework
+        run: |
+          ./scripts/build-native-core.sh
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate --spec AppleApp/project.yml
+
+      - name: Resolve Xcode packages
+        run: |
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project AppleApp/BitChord.xcodeproj \
+            -scheme BitChord
+
+      - name: Build unsigned iPad app
+        run: |
+          xcodebuild \
+            -project AppleApp/BitChord.xcodeproj \
+            -scheme BitChord \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/BitChordBuild" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+
+          APP="$RUNNER_TEMP/BitChordBuild/Build/Products/Release-iphoneos/BitChord.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "Build succeeded without the expected app directory."
+            find "$RUNNER_TEMP/BitChordBuild/Build/Products" -maxdepth 3 -print
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/ipa/Payload/BitChord.app"
+
+          cd "$RUNNER_TEMP/ipa"
+          /usr/bin/zip -qry "$RUNNER_TEMP/BitChord-unsigned.ipa" Payload
+
+      - name: Upload iPad IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitChord-unsigned-IPA
+          path: ${{ runner.temp }}/BitChord-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
